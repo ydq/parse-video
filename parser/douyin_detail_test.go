@@ -1,116 +1,109 @@
 package parser
 
 import (
-	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/go-resty/resty/v2"
 )
 
-func TestDouyinSM3(t *testing.T) {
+func TestExtractDouyinAwemeID(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
-		want  string
+		name string
+		text string
+		want string
 	}{
-		{
-			name:  "standard abc vector",
-			input: "abc",
-			want:  "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0",
-		},
-		{
-			name:  "standard 64-byte vector",
-			input: strings.Repeat("abcd", 16),
-			want:  "debe9ff92275b8a138604889c18e5a4d6fdb70e5387e5765293dcba39c0c5732",
-		},
+		{"video URL", "https://www.douyin.com/video/7450123456789012345", "7450123456789012345"},
+		{"share note URL", "https://www.iesdouyin.com/share/note/7450123456789012346/", "7450123456789012346"},
+		{"modal URL", "https://www.douyin.com/jingxuan?modal_id=7450123456789012347", "7450123456789012347"},
+		{"JSON item ID", `{"itemId":"7450123456789012348"}`, "7450123456789012348"},
+		{"JavaScript item ID", `itemId: '7450123456789012349'`, "7450123456789012349"},
+		{"not found", "https://v.douyin.com/abcdef/", ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := douyinSM3([]byte(tt.input))
-			if got := hex.EncodeToString(got[:]); got != tt.want {
-				t.Fatalf("douyinSM3() = %s, want %s", got, tt.want)
+			if got := extractDouyinAwemeID(tt.text); got != tt.want {
+				t.Fatalf("extractDouyinAwemeID() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestMakeDouyinABogusDeterministic(t *testing.T) {
-	query := douyinWebDetailQuery("7450123456789012345")
-	got := makeDouyinABogus(query, "GET", 1720000000123, 1720000000129, 1234, 5678, 9012)
-	const want = "E7mhBdugDifihdWk5l/LfY3q6fuVYmQ/0SVkMD2ffaDOJL39HMOk9exobQ4vpY2NZfmv2-ujy5kSYrrMicQnA3v6HSRKl2xp-g00t-P2so0j5ZhjCfuDnzfF-vzWt-Bd-Jd3Ech/ovKSKYi0AIee-wHvyhnFwo8sNiD4"
-	if got != want {
-		t.Fatalf("makeDouyinABogus() = %q, want %q", got, want)
+func TestResolveDouyinAwemeIDFromRedirect(t *testing.T) {
+	const videoID = "7450123456789012345"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/short" {
+			if got := request.Header.Get(HttpHeaderUserAgent); got != douyinShareUserAgent {
+				t.Errorf("User-Agent = %q, want %q", got, douyinShareUserAgent)
+			}
+			http.Redirect(writer, request, server.URL+"/video/"+videoID, http.StatusFound)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	got, resolvedURL, err := resolveDouyinAwemeID(resty.New(), server.URL+"/short")
+	if err != nil {
+		t.Fatalf("resolveDouyinAwemeID() error = %v", err)
+	}
+	if got != videoID {
+		t.Errorf("video ID = %q, want %q", got, videoID)
+	}
+	if resolvedURL == nil || resolvedURL.Path != "/video/"+videoID {
+		t.Errorf("resolved URL = %v", resolvedURL)
 	}
 }
 
-func TestDouyinWebDetailQueryPreservesSignatureOrder(t *testing.T) {
+func TestResolveDouyinAwemeIDFromBody(t *testing.T) {
 	const videoID = "7450123456789012345"
-	want := strings.Join([]string{
-		"device_platform=webapp",
-		"aid=6383",
-		"channel=channel_pc_web",
-		"pc_client_type=1",
-		"version_code=290100",
-		"version_name=29.1.0",
-		"cookie_enabled=true",
-		"screen_width=1920",
-		"screen_height=1080",
-		"browser_language=zh-CN",
-		"browser_platform=Win32",
-		"browser_name=Chrome",
-		"browser_version=130.0.0.0",
-		"browser_online=true",
-		"engine_name=Blink",
-		"engine_version=130.0.0.0",
-		"os_name=Windows",
-		"os_version=10",
-		"cpu_core_num=12",
-		"device_memory=8",
-		"platform=PC",
-		"downlink=10",
-		"effective_type=4g",
-		"from_user_page=1",
-		"locate_query=false",
-		"need_time_list=1",
-		"pc_libra_divert=Windows",
-		"publish_video_strategy_type=2",
-		"round_trip_time=0",
-		"show_live_replay_strategy=1",
-		"time_list_query=0",
-		"whale_cut_token=",
-		"update_version_code=170400",
-		"msToken=",
-		"aweme_id=" + videoID,
-	}, "&")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`<script>window.DATA={"itemId":"` + videoID + `"}</script>`))
+	}))
+	defer server.Close()
 
+	got, _, err := resolveDouyinAwemeID(resty.New(), server.URL+"/short")
+	if err != nil {
+		t.Fatalf("resolveDouyinAwemeID() error = %v", err)
+	}
+	if got != videoID {
+		t.Errorf("video ID = %q, want %q", got, videoID)
+	}
+}
+
+func TestDouyinWebDetailQuery(t *testing.T) {
+	const videoID = "7450123456789012345"
+	const want = "aweme_id=7450123456789012345&aid=6383&device_platform=webapp"
 	if got := douyinWebDetailQuery(videoID); got != want {
 		t.Fatalf("douyinWebDetailQuery() = %q, want %q", got, want)
 	}
 }
 
-func TestDouyinWebDetailFetcherFetchesOfficialDetail(t *testing.T) {
+func TestDouyinWebDetailFetcherFetchesOfficialDetailWithoutCookieOrSignature(t *testing.T) {
 	const videoID = "7450123456789012345"
-	query := douyinWebDetailQuery(videoID)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/aweme/v1/web/aweme/detail/" {
 			t.Errorf("request path = %q", request.URL.Path)
 		}
-		if request.Header.Get(HttpHeaderCookie) != "sessionid=deployment-owned-cookie" {
-			t.Errorf("Cookie = %q", request.Header.Get(HttpHeaderCookie))
+		if request.URL.RawQuery != douyinWebDetailQuery(videoID) {
+			t.Errorf("query = %q, want %q", request.URL.RawQuery, douyinWebDetailQuery(videoID))
 		}
-		if request.Header.Get(HttpHeaderReferer) != "https://www.douyin.com/" {
-			t.Errorf("Referer = %q", request.Header.Get(HttpHeaderReferer))
+		if got := request.Header.Get(HttpHeaderUserAgent); got != douyinWebDetailUserAgent {
+			t.Errorf("User-Agent = %q, want %q", got, douyinWebDetailUserAgent)
 		}
-		if got := strings.TrimSuffix(request.URL.RawQuery, "&a_bogus="+request.URL.Query().Get("a_bogus")); got != query {
-			t.Errorf("signed query = %q, want %q", got, query)
+		if got := request.Header.Get(HttpHeaderReferer); got != "https://www.douyin.com/" {
+			t.Errorf("Referer = %q", got)
 		}
-		if aBogus := request.URL.Query().Get("a_bogus"); aBogus == "" {
-			t.Error("a_bogus is missing")
+		if got := request.Header.Get(HttpHeaderCookie); got != "" {
+			t.Errorf("Cookie = %q, want empty", got)
+		}
+		if got := request.URL.Query().Get("a_bogus"); got != "" {
+			t.Errorf("a_bogus = %q, want empty", got)
 		}
 
 		writer.Header().Set("Content-Type", "application/json")
@@ -118,11 +111,8 @@ func TestDouyinWebDetailFetcherFetchesOfficialDetail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	fetcher := newDouyinWebDetailFetcher(resty.New(), "sessionid=deployment-owned-cookie")
+	fetcher := newDouyinWebDetailFetcher(resty.New())
 	fetcher.endpoint = server.URL + "/aweme/v1/web/aweme/detail/"
-	fetcher.now = func() time.Time { return time.UnixMilli(1720000000123) }
-	fetcher.random = func() int { return 1234 }
-
 	data, err := fetcher.fetch(videoID)
 	if err != nil {
 		t.Fatalf("fetch() error = %v", err)
@@ -130,48 +120,70 @@ func TestDouyinWebDetailFetcherFetchesOfficialDetail(t *testing.T) {
 	if got := data.Get("aweme_id").String(); got != videoID {
 		t.Errorf("aweme_id = %q, want %q", got, videoID)
 	}
-	if got := data.Get("desc").String(); got != "native detail" {
-		t.Errorf("desc = %q, want native detail", got)
-	}
 }
 
-func TestDouyinWebDetailFetcherReportsOfficialErrorStatus(t *testing.T) {
+func TestDouyinWebDetailFetcherRetriesInvalidResponses(t *testing.T) {
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"status_code":4,"status_msg":"detail unavailable","aweme_detail":{}}`))
+		switch requests.Add(1) {
+		case 1:
+			_, _ = writer.Write([]byte("not JSON"))
+		case 2:
+			_, _ = writer.Write([]byte(`{"status_code":0,"aweme_detail":null}`))
+		default:
+			_, _ = writer.Write([]byte(`{"aweme_detail":{"aweme_id":"7450123456789012345"}}`))
+		}
 	}))
 	defer server.Close()
 
-	fetcher := newDouyinWebDetailFetcher(resty.New(), "sessionid=deployment-owned-cookie")
+	fetcher := newDouyinWebDetailFetcher(resty.New())
 	fetcher.endpoint = server.URL
-	fetcher.now = func() time.Time { return time.UnixMilli(1720000000123) }
-	fetcher.random = func() int { return 1234 }
+	if _, err := fetcher.fetch("7450123456789012345"); err != nil {
+		t.Fatalf("fetch() error = %v", err)
+	}
+	if got := requests.Load(); got != douyinDetailMaxAttempts {
+		t.Errorf("requests = %d, want %d", got, douyinDetailMaxAttempts)
+	}
+}
 
+func TestDouyinWebDetailFetcherReportsFailureAfterThreeAttempts(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = writer.Write([]byte(`{"aweme_detail":null,"filter_detail":{"detail_msg":"作品不可用"}}`))
+	}))
+	defer server.Close()
+
+	fetcher := newDouyinWebDetailFetcher(resty.New())
+	fetcher.endpoint = server.URL
 	_, err := fetcher.fetch("7450123456789012345")
 	if err == nil {
-		t.Fatal("fetch() error = nil, want official detail status error")
+		t.Fatal("fetch() error = nil, want failure")
 	}
-	for _, want := range []string{`aweme id ""`, "status_code=4", `status_msg="detail unavailable"`} {
+	for _, want := range []string{"after 3 attempts", "作品不可用"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("fetch() error = %q, want substring %q", err, want)
 		}
 	}
+	if got := requests.Load(); got != douyinDetailMaxAttempts {
+		t.Errorf("requests = %d, want %d", got, douyinDetailMaxAttempts)
+	}
 }
 
-func TestDouyinWebDetailFetcherRequiresDeploymentCookie(t *testing.T) {
+func TestDouyinWebDetailFetcherRejectsInvalidIDBeforeRequest(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		called = true
 	}))
 	defer server.Close()
 
-	fetcher := newDouyinWebDetailFetcher(resty.New(), "")
+	fetcher := newDouyinWebDetailFetcher(resty.New())
 	fetcher.endpoint = server.URL
-	_, err := fetcher.fetch("7450123456789012345")
-	if err == nil || !strings.Contains(err.Error(), douyinCookieEnv+" is required") {
-		t.Fatalf("fetch() error = %v, want missing cookie error", err)
+	_, err := fetcher.fetch("not-an-id")
+	if err == nil || !strings.Contains(err.Error(), "invalid douyin video id") {
+		t.Fatalf("fetch() error = %v, want invalid ID error", err)
 	}
 	if called {
-		t.Fatal("fetch() made an HTTP request without a deployment cookie")
+		t.Fatal("fetch() made an HTTP request for an invalid ID")
 	}
 }
